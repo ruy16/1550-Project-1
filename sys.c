@@ -38,10 +38,13 @@
 #include <linux/syscalls.h>
 #include <linux/kprobes.h>
 #include <linux/user_namespace.h>
+#include <sem.h>
 
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/unistd.h>
+
+
 
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a,b)	(-EINVAL)
@@ -75,6 +78,9 @@
 
 int overflowuid = DEFAULT_OVERFLOWUID;
 int overflowgid = DEFAULT_OVERFLOWGID;
+DEFINE_SPINLOCK(sem_lock);//gets a lock
+
+
 
 #ifdef CONFIG_UID16
 EXPORT_SYMBOL(overflowuid);
@@ -1603,6 +1609,7 @@ out:
 	return err;
 }
 
+
 /*
  * Supplementary group IDs
  */
@@ -2357,3 +2364,133 @@ int orderly_poweroff(bool force)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(orderly_poweroff);
+
+/*******FOR DEBUGGING*********/
+void print_queue(struct pque* pq){
+	struct Node* current_node = pq->head;
+	if(current_node == NULL){
+		printk(KERN_DEBUG "pq is empty\n");
+		return;
+	}
+	//int count = 1;
+	while(current_node != NULL){
+		printk(KERN_DEBUG "P%d : %d\n",current_node->task->pid,task_nice(current_node->task));
+		current_node = current_node->next;
+	}
+}
+/*******FOR DEBUGGING*********/
+
+/*******IMPLEMENTING THE PRIORITY QUEUE*******/
+//call this a constructor, makes a empty PQ
+void que_init(struct cs1550_sem* sem){
+	sem->pq = (struct pque*)kmalloc(sizeof(struct pque),GFP_KERNEL);
+	printk(KERN_DEBUG "We are in init() After init the queue's pointer:%p\n",sem->pq);
+	sem->pq->head = NULL;
+}
+// removes the top of the queue 
+void dequeue(struct pque* queue){
+	printk(KERN_DEBUG "We need to dequeue a process\n");
+	printk(KERN_DEBUG "we are in dequeue() The queue is at %p\n",queue);
+	printk(KERN_DEBUG "The process that needs to wake up is: %d,it has a priority of %d\n",queue->head->task->pid,task_nice(queue->head->task));
+	printk(KERN_DEBUG "And the queue is like ...this now: \n");
+	print_queue(queue);
+	wake_up_process(queue->head->task);//wake up the head
+	printk(KERN_DEBUG "We just woke up proc %d\n",queue->head->task->pid);
+	queue->head = queue->head->next;//change the head
+	if(queue->head == NULL){printk(KERN_DEBUG "The queue is empty now\n");}
+	else{
+		printk(KERN_DEBUG "The new head is proc %d\n and the queue...->",queue->head->task->pid);
+		print_queue(queue);
+	}	
+}
+//push a item into the queue
+void enqueue(struct pque* queue){
+	//if the queue is empty
+	printk(KERN_DEBUG "we need to enqueue this process %d,go to sleep\n",current->pid);
+	printk(KERN_DEBUG "we are in enqueue() The queue is at %p\n",queue);
+	printk(KERN_DEBUG "Before enqueue take place The queue is like....-> \n");
+	print_queue(queue);
+	if(queue->head == NULL){
+		struct Node* new_head_node = (struct Node*)kmalloc(sizeof(struct Node),GFP_KERNEL);
+		new_head_node->task = current;
+		new_head_node->next = NULL;
+		queue->head = new_head_node;
+		printk(KERN_DEBUG "After enqueue take place The queue is like....-> \n");
+		print_queue(queue);
+		return;
+	}
+
+	int current_task_priority = task_nice(current);
+	struct Node* current_node = queue->head;//current head in the queue
+	//check if this process has higher priority than the head
+	if(current_task_priority >= task_nice(queue->head->task)){
+			struct Node* new_head = (struct Node*)kmalloc(sizeof(struct Node),GFP_KERNEL);
+			new_head->task = current;
+			new_head->next = queue->head;
+			queue->head = new_head;
+			printk(KERN_DEBUG "After enqueue take place The queue is like....-> \n");
+			print_queue(queue);
+			return;
+		}
+	//if not find where it fits
+	//current_node = current_node -> next;
+	while(current_node != NULL){
+		if(current_task_priority <= task_nice(current_node->task)){
+			struct Node* new_node = (struct Node*)kmalloc(sizeof(struct Node),GFP_KERNEL);
+			new_node->task = current;
+			new_node->next = current_node->next;
+			current_node->next = new_node;
+			printk(KERN_DEBUG "After enqueue take place The queue is like....-> \n");
+			print_queue(queue);
+			return;
+		}
+		current_node = current_node -> next;//the next node
+	}
+}
+
+ /*******IMPLEMENTING THE PRIORITY QUEUE*******/
+//ADDED AS 1550-PROJECT1
+/*Syscall for decrment the semaphore => wait()*/
+asmlinkage long sys_cs1550_down(struct cs1550_sem *sem){
+	spin_lock(&sem_lock);//aquire()
+	printk(KERN_DEBUG "Down() is called the sem's value is %d\n",sem->value);
+	printk(KERN_DEBUG "the que is at %p\n",sem->pq);
+	//print_queue(sem->pq);
+	sem->value -=1;//--
+	/*if this semaphore is full, current proc goes to the waiting queue*/
+	if(sem->value < 0){
+		printk(KERN_DEBUG "The queue needs to be initialized,the que is at %p\n",sem->pq);
+		if(sem->pq == NULL){que_init(sem);}
+		printk(KERN_DEBUG "The queue shouldn't be NULL now: %p\n",sem->pq);
+		enqueue(sem->pq);
+		//sleep()
+		set_current_state(TASK_INTERRUPTIBLE); // block this process,PART1
+		schedule();//PART2
+		//here the PQ needs to be made
+	}
+	//sem->value -=1;
+	printk(KERN_DEBUG "After the down() the sem's value is %d\n",sem->value);
+	printk(KERN_DEBUG "After the down() the queue is at %p\n",sem->pq);
+	//print_queue(sem->pq);
+	spin_unlock(&sem_lock);//release()
+	
+	return 0;
+}
+/*Syscall for decrment the semaphore => signal()*/
+asmlinkage long sys_cs1550_up(struct cs1550_sem *sem){
+	spin_lock(&sem_lock);//aquire()
+	printk(KERN_DEBUG "Up is called,sem's value is %d\n",sem->value);
+	printk(KERN_DEBUG "the queue is at %p\n",sem->pq);
+	sem->value +=1;
+	//print_queue(sem->pq);
+	if(sem->value<=0){//if the queue is still full
+		//enqueue(sem->pq);
+		dequeue(sem->pq);
+	}
+	printk(KERN_DEBUG "After up() the sem's value is %d\n",sem->value);
+	printk(KERN_DEBUG "After up() the queue is at %p\n",sem->pq);
+	//print_queue(sem->pq);
+	spin_unlock(&sem_lock);//release()
+	
+	return 0;
+}
